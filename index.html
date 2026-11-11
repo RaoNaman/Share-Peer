@@ -21,6 +21,7 @@ textarea{width:100%;min-height:94px;resize:vertical;border:1px solid #ffffff18;b
 .note{font-size:11px;color:#8993a7;line-height:1.55;margin:12px 3px}.toast{position:fixed;left:50%;bottom:22px;transform:translate(-50%,20px);opacity:0;pointer-events:none;background:#24283a;border:1px solid var(--line);border-radius:13px;padding:10px 15px;font-size:12px;transition:.25s;z-index:5}.toast.show{opacity:1;transform:translate(-50%,0)}
 .overlay{position:fixed;inset:0;background:#03050bdc;backdrop-filter:blur(14px);display:none;place-items:center;padding:22px;z-index:10}.overlay.show{display:grid}.chooser{width:min(100%,420px);padding:25px}.chooser h2{margin:0 0 7px;font-size:20px}.chooser p{color:var(--muted);font-size:13px;margin:0 0 19px}.role-choice{display:grid;grid-template-columns:1fr 1fr;gap:10px}.role-choice button{padding:17px 8px;min-height:90px}.role-choice b{display:block;font-size:14px}.role-choice span{display:block;color:#aeb7c8;font-size:11px;margin-top:4px}
 .pending{border:1px solid #ffc66d55;background:#ffc66d0b;border-radius:14px;padding:12px;margin-top:10px}.pending p{font-size:12px;margin:0 0 8px;overflow-wrap:anywhere}
+.debug{margin-top:10px;padding:10px 12px;border:1px solid #ffffff12;border-radius:13px;background:#05070d88;color:#aeb7c8;font:11px/1.45 ui-monospace,monospace;white-space:pre-wrap;overflow-wrap:anywhere;max-height:110px;overflow:auto}.debug:empty{display:none}
 @media(max-width:420px){main{margin-top:18px}.card{padding:15px}.status{font-size:11px;padding:8px 10px}.brand h1{font-size:15px}}
 </style>
 </head>
@@ -49,6 +50,7 @@ textarea{width:100%;min-height:94px;resize:vertical;border:1px solid #ffffff18;b
   <div class="feed-head"><h2>Activity</h2><button class="small-btn" id="clearBtn">Clear</button></div>
   <div id="feed"><div class="empty">Your shared messages and files will appear here.</div></div>
  </section>
+ <div id="debug" class="debug" aria-live="polite"></div>
  <p class="note">Both devices must have this page open and be online. Peer-to-peer traffic is encrypted in transit by WebRTC, but the public PeerJS signaling service is used to find the other device. Avoid sharing sensitive files on an untrusted network.</p>
 </main>
 <div class="toast" id="toast"></div>
@@ -62,13 +64,13 @@ textarea{width:100%;min-height:94px;resize:vertical;border:1px solid #ffffff18;b
 'use strict';
 // Replace this value with your own long random string before deploying. It is a pairing
 // identifier, not authentication: anyone who learns the IDs can attempt to connect.
-const PAIR_SECRET = 'personal-bridge-x89k2-7vQ4mN8pL2';
+const PAIR_SECRET = 'CHANGE-THIS-TO-A-LONG-RANDOM-SECRET-32-CHARS-MINIMUM';
 const PREFIX = PAIR_SECRET.replace(/[^a-zA-Z0-9_-]/g,'').slice(0,48);
 const IDS = {pc: PREFIX + '-pc', mobile: PREFIX + '-mobile'};
 const CHUNK_SIZE = 64 * 1024;
 const $ = id => document.getElementById(id);
 let role = localStorage.getItem('bridge-role');
-let peer = null, conn = null, heartbeat = null, reconnectTimer = null;
+let peer = null, conn = null, heartbeat = null, reconnectTimer = null, attemptTimer = null;
 let incoming = null, sending = false, connectionAttempt = false, peerReady = false;
 let pendingSave = null;
 
@@ -97,40 +99,56 @@ const showProgress = (label, pct) => {$('transferInfo').style.display='block';$(
 const hideProgress = () => { $('transferInfo').style.display='none';$('transferProgress').style.display='none';$('transferBar').style.width='0'; };
 function setRole(next) {
  role=next; localStorage.setItem('bridge-role',role); $('roleOverlay').classList.remove('show');
- if(peer){try{peer.destroy();}catch{} peer=null;} conn=null; peerReady=false; startPeer();
+ clearTimeout(attemptTimer);connectionAttempt=false;if(peer){try{peer.destroy();}catch{} peer=null;} conn=null; peerReady=false; startPeer();
+}
+function log(message) {
+ const line = `[${new Date().toLocaleTimeString()}] ${message}`;
+ const panel = $('debug');
+ panel.textContent = (line + '\n' + panel.textContent).slice(0,1400);
 }
 function connectToPartner() {
- if(!peer || peer.destroyed || !peerReady || conn?.open || connectionAttempt) return;
+ // Only the PC initiates. This avoids simultaneous cross-dial races on both devices.
+ if(role !== 'pc' || !peer || peer.destroyed || !peerReady || conn?.open || connectionAttempt) return;
  connectionAttempt=true; status('searching','Searching for partner...');
- const target=IDS[role==='pc'?'mobile':'pc'];
+ const target=IDS.mobile;
+ log(`PC dialing partner ID: ${target}`);
  try {
-  const c=peer.connect(target,{reliable:true,serialization:'binary',metadata:{app:'personal-bridge',version:1}});
+  const c=peer.connect(target,{reliable:true,serialization:'binary',metadata:{app:'personal-bridge',version:2}});
   attachConnection(c);
-  const timeout=setTimeout(()=>{connectionAttempt=false;if(!c.open)try{c.close();}catch{}},8000);
-  c.on('open',()=>{clearTimeout(timeout);connectionAttempt=false;});
- } catch(e){connectionAttempt=false;status('disconnected','Disconnected');}
+  clearTimeout(attemptTimer);
+  attemptTimer=setTimeout(()=>{
+   if(connectionAttempt && !c.open){connectionAttempt=false;log('Connection attempt timed out; will retry.');try{c.close();}catch{}}
+  },12000);
+ } catch(e){connectionAttempt=false;log(`Dial error: ${e.message||e}`);status('disconnected','Disconnected');}
 }
 function attachConnection(c) {
  if(conn && conn!==c && conn.open) { try{c.close();}catch{} return; }
  conn=c;
- c.on('open',()=>{connectionAttempt=false;status('connected','Connected');$('sendBtn').disabled=!$('message').value.trim();});
+ c.on('open',()=>{clearTimeout(attemptTimer);connectionAttempt=false;log('Data channel connected.');status('connected','Connected');$('sendBtn').disabled=!$('message').value.trim();});
  c.on('data',handleData);
- c.on('close',()=>{if(conn===c)conn=null;connectionAttempt=false;status('searching','Searching for partner...');});
- c.on('error',()=>{if(conn===c)conn=null;connectionAttempt=false;status('searching','Searching for partner...');});
+ c.on('close',()=>{if(conn===c)conn=null;clearTimeout(attemptTimer);connectionAttempt=false;log('Data channel closed; waiting to reconnect.');status('searching','Searching for partner...');});
+ c.on('error',err=>{if(conn===c)conn=null;clearTimeout(attemptTimer);connectionAttempt=false;log(`Data connection error: ${err?.message||err}`);status('searching','Searching for partner...');});
 }
 function startPeer() {
  if(!role) {$('roleOverlay').classList.add('show');return;}
  status('searching','Searching for partner...');
+ log(`Starting as ${role.toUpperCase()} · ID ${IDS[role]}`);
  try {
-  peer=new Peer(IDS[role],{debug:0});
-  peer.on('open',()=>{peerReady=true;status('searching','Searching for partner...');connectToPartner();});
-  peer.on('connection',c=>attachConnection(c));
-  peer.on('disconnected',()=>{peerReady=false;status('searching','Searching for partner...');try{peer.reconnect();}catch{}});
-  peer.on('error',err=>{
-   if(err.type==='unavailable-id'){status('disconnected','Pairing ID in use');toast('This role is already active in another tab/device.');}
-   else status('searching','Searching for partner...');
+  peer=new Peer(IDS[role],{debug:2,host:'0.peerjs.com',port:443,path:'/',secure:true});
+  peer.on('open',id=>{peerReady=true;log(`Signaling server registered ID: ${id}`);status('searching','Searching for partner...');if(role==='pc')connectToPartner();});
+  peer.on('connection',c=>{
+   if(role!=='mobile'){log('Unexpected incoming connection on PC; rejected.');try{c.close();}catch{}return;}
+   log('Incoming PC connection received.');attachConnection(c);
   });
- } catch(e){status('disconnected','Disconnected');}
+  peer.on('disconnected',()=>{peerReady=false;log('PeerJS signaling socket disconnected; reconnecting.');status('searching','Searching for partner...');try{peer.reconnect();}catch(e){log(`Signaling reconnect failed: ${e.message||e}`);}});
+  peer.on('error',err=>{
+   const detail=`PeerJS ${err.type||'error'}: ${err.message||'No details'}`;
+   log(detail);
+   if(err.type==='unavailable-id') {status('disconnected','Pairing ID already in use');toast('This pairing ID is already active. Check that only one PC and one Mobile are using this secret.');}
+   else if(err.type==='peer-unavailable') {status('searching','Searching for partner...');log('Partner is not registered yet; retrying shortly.');}
+   else status('disconnected',`Connection issue: ${err.type||'error'}`);
+  });
+ } catch(e){log(`Peer startup failed: ${e.message||e}`);status('disconnected','Disconnected');}
 }
 function send(data) { if(!conn?.open) {toast('Partner is not connected yet');return false;} try{conn.send(data);return true;}catch(e){toast('Could not send data');return false;} }
 function sendText() {
@@ -218,10 +236,11 @@ if(!role){$('roleOverlay').classList.add('show');}
 else startPeer();
 // Heartbeat: re-establish PeerJS signaling and partner connection after sleep/network changes.
 heartbeat=setInterval(()=>{
- if(!peer || peer.destroyed){if(role)startPeer();return;}
- if(peer.disconnected){try{peer.reconnect();}catch{}return;}
+ if(!role)return;
+ if(!peer || peer.destroyed){startPeer();return;}
+ if(peer.disconnected){try{peer.reconnect();}catch(e){log(`Heartbeat reconnect failed: ${e.message||e}`);}return;}
  if(conn?.open){status('connected','Connected');return;}
- connectionAttempt=false;connectToPartner();
+ if(role==='pc' && peerReady)connectToPartner();
 },3000);
 window.addEventListener('online',()=>{if(peer?.disconnected)try{peer.reconnect();}catch{};connectionAttempt=false;connectToPartner();});
 window.addEventListener('beforeunload',()=>{clearInterval(heartbeat);clearTimeout(reconnectTimer);});
